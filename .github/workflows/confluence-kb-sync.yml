@@ -1,10 +1,11 @@
 # Mirrors README.md, docs/, ADR-DECISIONS/ and TEMPLATES/ into Confluence with repo_to_confluence.py.
 # Put this file in .github/workflows/; repo_to_confluence.py sits at the repository root.
 #
-# Settings > Secrets and variables > Actions:
+# Settings > Environments > the environment named in the job's `environment:` line below:
 #   secret   ATLASSIAN_SERVICE_KEY  API key of the Atlassian service account the pages are written as
 #   variable CONFLUENCE_SPACE_KEY   e.g. KB
-#   variable CONFLUENCE_SITE_URL    e.g. https://acme.atlassian.net (also the base of links between pages)
+#   variable ATLASSIAN_CLOUD_ID     site URL, e.g. https://acme.atlassian.net (also the base of links between pages)
+# A job only sees an environment's secrets and variables when it names that environment.
 name: confluence-kb-sync
 
 on:
@@ -43,6 +44,7 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    environment: REPLACE-WITH-YOUR-ENVIRONMENT-NAME  # exactly as shown in Settings > Environments
     timeout-minutes: 120
     steps:
       - name: Verify synchronization branch
@@ -78,10 +80,13 @@ jobs:
         env:
           ATLASSIAN_SERVICE_KEY: ${{ secrets.ATLASSIAN_SERVICE_KEY }}
           SPACE_KEY: ${{ vars.CONFLUENCE_SPACE_KEY }}
-          SITE_URL: ${{ vars.CONFLUENCE_SITE_URL }}
+          SITE_URL: ${{ vars.ATLASSIAN_CLOUD_ID }}
         # --mode commits: one Confluence version per change merged into main.
         # For one version per release tag instead: --mode tags --include-head
         run: |
+          : "${ATLASSIAN_SERVICE_KEY:?Secret ATLASSIAN_SERVICE_KEY is empty: add it to the environment named in this job}"
+          : "${SPACE_KEY:?Variable CONFLUENCE_SPACE_KEY is empty: add it (e.g. KB) to the environment named in this job}"
+          : "${SITE_URL:?Variable ATLASSIAN_CLOUD_ID is empty: check the environment name in this job and the variable name}"
           mkdir -p "$RUNNER_TEMP/kb-sync"
           python repo_to_confluence.py --repo . \
             --space-key "$SPACE_KEY" --cloud-id "$SITE_URL" \
