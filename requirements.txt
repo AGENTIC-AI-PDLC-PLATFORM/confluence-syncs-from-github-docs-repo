@@ -1,0 +1,28 @@
+
+
+
+
+
+# Python 3.10+ required (uses PEP 604 unions, structural pattern features, etc.)
+
+# --- Direct dependency declared in the module docstring ---
+# MCP Python SDK (supports 1.x and 2.x). Installs the `mcp` package and CLI.
+# Provides: mcp.ClientSession, mcp.client.streamable_http, mcp.types.PaginatedRequestParams
+#mcp==2.0.0
+mcp>=1.2.0,<3.0.0
+
+
+# --- Transitive but pinned for reproducibility ---
+# The MCP SDK depends on httpx for the streamable HTTP transport
+# (create_mcp_http_client / streamable_http_client use httpx under the hood).
+httpx
+
+# AnyIO is used by the MCP SDK's async transport layer (asyncio backend).
+anyio
+
+
+# Pydantic is required by mcp.types for its data models.
+pydantic
+
+# "PyYAML" IS THE PYTHON "LIBRARY" FOR  READING (PARSE) AND WRITING (EMIT) "YAML-FORMATED" DATA. 
+pyyaml

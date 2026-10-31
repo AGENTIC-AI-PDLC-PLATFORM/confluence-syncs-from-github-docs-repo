@@ -1,0 +1,98 @@
+# Mirrors README.md, docs/, ADR-DECISIONS/ and TEMPLATES/ into Confluence with repo_to_confluence.py.
+# Put this file in .github/workflows/; repo_to_confluence.py sits at the repository root.
+#
+# Settings > Secrets and variables > Actions:
+#   secret   ATLASSIAN_SERVICE_KEY  API key of the Atlassian service account the pages are written as
+#   variable CONFLUENCE_SPACE_KEY   e.g. KB
+#   variable CONFLUENCE_SITE_URL    e.g. https://acme.atlassian.net (also the base of links between pages)
+name: confluence-kb-sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "docs/**"
+      - "**/ADR-DECISIONS/**"
+      - "**/TEMPLATES/**"
+      - "repo_to_confluence.py"
+      - ".github/workflows/confluence-kb-sync.yml"
+  schedule:
+    - cron: "17 5 * * *"  # daily: banner check (--verify-hours 24) and the list of orphan pages
+  workflow_dispatch:      # no inputs: the sync command stays in this file (see the script's Safety notes);
+                          # a manual run on another branch fails at "Verify synchronization branch"
+
+# repo_to_confluence.py's own lock (--lock-file) only covers one machine, and every run gets a fresh
+# runner. This group runs the syncs of this repository one at a time, whatever started them (push,
+# schedule, manual run). A run in progress always finishes; a new run waits, and replaces a run that
+# is already waiting: the run that goes ahead adds every version still missing.
+# The group name is fixed on purpose. Any other workflow of this repository that runs the sync must use
+# the same group, so the two never write at the same time; ${{ github.workflow }} in the name would give
+# each workflow its own group. GitHub already scopes a group to its repository, so the repository name
+# adds nothing, and github.ref must stay out: runs on different branches would then overlap.
+# A sync from another repository into the same space can still run at the same time. That is safe,
+# since each repository writes only its own pages, but both share the service account's hourly MCP
+# call budget.
+concurrency:
+  group: confluence-kb-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Verify synchronization branch
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Confluence synchronization must run against main."
+            exit 1
+          fi
+
+      - name: Check out the whole history and the tags
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # every version is read from git; the script refuses a shallow clone
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the script's dependencies
+        run: python -m pip install --upgrade mcp pyyaml
+
+      # The state file only saves MCP calls: without it (cache miss, eviction, failed restore), pages are
+      # found by title and recognized by their marker. Runs are serialized (concurrency above), so each
+      # run restores the state the previous one saved.
+      - name: Restore the state file of the previous run
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/kb-sync
+          key: kb-sync-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: kb-sync-state-
+
+      - name: Sync to Confluence
+        env:
+          ATLASSIAN_SERVICE_KEY: ${{ secrets.ATLASSIAN_SERVICE_KEY }}
+          SPACE_KEY: ${{ vars.CONFLUENCE_SPACE_KEY }}
+          SITE_URL: ${{ vars.CONFLUENCE_SITE_URL }}
+        # --mode commits: one Confluence version per change merged into main.
+        # For one version per release tag instead: --mode tags --include-head
+        run: |
+          mkdir -p "$RUNNER_TEMP/kb-sync"
+          python repo_to_confluence.py --repo . \
+            --space-key "$SPACE_KEY" --cloud-id "$SITE_URL" \
+            --mode commits \
+            --state-file "$RUNNER_TEMP/kb-sync/state.json"
+
+      # Saved even when the sync failed: the script writes a page's entry only after the page's
+      # Confluence writes succeeded, so a failed run's state is safe to reuse.
+      - name: Save the state file for the next run
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/kb-sync
+          key: kb-sync-state-${{ github.run_id }}-${{ github.run_attempt }}
