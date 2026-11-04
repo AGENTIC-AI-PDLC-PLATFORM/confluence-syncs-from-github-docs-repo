@@ -1,0 +1,135 @@
+# Central workflow: lives in one repo (e.g. acme/kb-sync) next to repo_to_confluence.py and
+# sync_org.sh, and mirrors the docs of every org repository tagged `kb-sync` into Confluence.
+#
+# Setup
+#   Variables: CONFLUENCE_SPACE_KEY (e.g. KB), ATLASSIAN_CLOUD_ID (e.g. https://acme.atlassian.net),
+#              KB_SYNC_CLIENT_ID (the GitHub App's Client ID, Iv…) or KB_SYNC_APP_ID (its numeric
+#              App ID), optional KB_TOPIC (default kb-sync), KB_MODE (tags|commits),
+#              KB_CALLS_PER_HOUR (default 450, safe on every plan; Standard: 900), KB_INCLUDE_HEAD (default true)
+#   Never pass --transform-cmd from workflow_dispatch inputs or dispatch payloads: it runs as a
+#   command on the runner. Hard-code it in this file or keep it in an admin-only variable.
+#   Secrets:   ATLASSIAN_SERVICE_KEY (Atlassian service account API key with Confluence
+#              read/write/search MCP scopes), KB_SYNC_APP_PRIVATE_KEY (GitHub App with
+#              Contents: read on the org repositories)
+#   Atlassian: an org admin enables API-token authentication for the Rovo MCP Server.
+name: Confluence KB sync
+
+on:
+  schedule:
+    - cron: "23 * * * *"   # hourly: new tags / merged changes appear within the hour
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "tags = one Confluence version per release tag; commits = one per merged change"
+        type: choice
+        options: [tags, commits]
+        default: tags
+      dry_run:
+        description: "Only print the plan"
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [kb-sync]       # optional: repos can request an immediate sync on release
+
+concurrency:
+  group: confluence-kb-sync   # one sync at a time: shared rate limit, no duplicate page creation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      MODE: ${{ inputs.mode || vars.KB_MODE || 'tags' }}
+      STATE_FILE: ${{ github.workspace }}/kb-sync-state.json
+      WORKDIR: ${{ github.workspace }}/.kb-sync-clones
+    steps:
+      - uses: actions/checkout@v5
+
+      # Fail fast with a readable message when a variable or secret is missing or empty
+      # (e.g. KB_SYNC_CLIENT_ID saved as a secret: vars.* only reads the Variables tab).
+      # Secrets are only tested for presence, never printed.
+      - name: Check configuration
+        env:
+          KB_SYNC_CLIENT_ID: ${{ vars.KB_SYNC_CLIENT_ID }}
+          KB_SYNC_APP_ID: ${{ vars.KB_SYNC_APP_ID }}
+          CONFLUENCE_SPACE_KEY: ${{ vars.CONFLUENCE_SPACE_KEY }}
+          ATLASSIAN_CLOUD_ID: ${{ vars.ATLASSIAN_CLOUD_ID }}
+          HAS_APP_KEY: ${{ secrets.KB_SYNC_APP_PRIVATE_KEY != '' }}
+          HAS_ATLASSIAN_KEY: ${{ secrets.ATLASSIAN_SERVICE_KEY != '' }}
+        run: |
+          missing=()
+          if [ -z "$KB_SYNC_CLIENT_ID" ] && [ -z "$KB_SYNC_APP_ID" ]; then
+            missing+=("variable KB_SYNC_CLIENT_ID (or KB_SYNC_APP_ID)")
+          fi
+          for v in CONFLUENCE_SPACE_KEY ATLASSIAN_CLOUD_ID; do
+            [ -n "${!v}" ] || missing+=("variable $v")
+          done
+          [ "$HAS_APP_KEY" = true ]       || missing+=("secret KB_SYNC_APP_PRIVATE_KEY")
+          [ "$HAS_ATLASSIAN_KEY" = true ] || missing+=("secret ATLASSIAN_SERVICE_KEY")
+          if [ ${#missing[@]} -gt 0 ]; then
+            for m in "${missing[@]}"; do
+              echo "::error::missing or empty: $m (Settings → Secrets and variables → Actions; vars.* reads the Variables tab, secrets.* the Secrets tab; Environment-scoped values need environment: on the job)"
+            done
+            exit 1
+          fi
+          if [ -n "$KB_SYNC_CLIENT_ID" ]; then
+            if ! [[ "$KB_SYNC_CLIENT_ID" =~ ^Iv[A-Za-z0-9.]+$ ]]; then
+              echo "::error::KB_SYNC_CLIENT_ID must be the Client ID from the GitHub App's settings page (starts with Iv), got '$KB_SYNC_CLIENT_ID'"
+              exit 1
+            fi
+          elif ! [[ "$KB_SYNC_APP_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::KB_SYNC_APP_ID must be the numeric App ID from the GitHub App's settings page (not the installation ID), got '$KB_SYNC_APP_ID'"
+            exit 1
+          fi
+          echo "Configuration OK"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install "mcp>=1.10" pyyaml   # pyyaml: ADR and template front matter
+
+      - id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          # v3 takes client-id (app-id is deprecated); GitHub accepts the Client ID or the App ID
+          client-id: ${{ vars.KB_SYNC_CLIENT_ID || vars.KB_SYNC_APP_ID }}
+          private-key: ${{ secrets.KB_SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # The state file only saves MCP calls; the sync-ref marker on each page is the source
+      # of truth, so losing the cache is harmless.
+      - name: Restore sync state
+        uses: actions/cache/restore@v5
+        with:
+          path: kb-sync-state.json
+          key: kb-sync-state-${{ github.run_id }}
+          restore-keys: kb-sync-state-
+
+      - name: Sync organization docs to Confluence
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ATLASSIAN_SERVICE_KEY: ${{ secrets.ATLASSIAN_SERVICE_KEY }}
+          ATLASSIAN_CLOUD_ID: ${{ vars.ATLASSIAN_CLOUD_ID }}
+          CONFLUENCE_SPACE_KEY: ${{ vars.CONFLUENCE_SPACE_KEY }}
+          TOPIC: ${{ vars.KB_TOPIC || 'kb-sync' }}
+          CALLS_PER_HOUR: ${{ vars.KB_CALLS_PER_HOUR || '450' }}
+          INCLUDE_HEAD: ${{ vars.KB_INCLUDE_HEAD || 'true' }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          chmod +x sync_org.sh
+          extra=(--mode "$MODE" --calls-per-hour "$CALLS_PER_HOUR")
+          if [ "$MODE" = tags ] && [ "$INCLUDE_HEAD" = true ]; then extra+=(--include-head); fi
+          if [ "$DRY_RUN" = true ]; then extra+=(--dry-run); fi
+          ./sync_org.sh "${{ github.repository_owner }}" "$TOPIC" -- "${extra[@]}"
+
+      - name: Save sync state
+        if: always() && hashFiles('kb-sync-state.json') != ''
+        uses: actions/cache/save@v5
+        with:
+          path: kb-sync-state.json
+          key: kb-sync-state-${{ github.run_id }}

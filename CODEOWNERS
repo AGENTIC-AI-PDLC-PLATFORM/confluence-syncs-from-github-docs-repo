@@ -1,0 +1,6 @@
+# CODEOWNERS — last matching pattern wins
+# Enforced by a "Require review from Code Owners" ruleset on main.
+
+# coe-platform-lead: will be automatically requested to review EVERY pull requests that modify files in THIS repository 
+# UNLESS SOMETHING IS listed below, i.e. README, CI, signing and publication 
+*              @platform-team/coe-platform-lead"
