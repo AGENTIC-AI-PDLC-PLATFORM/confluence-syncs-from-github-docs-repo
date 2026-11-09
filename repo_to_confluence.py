@@ -105,10 +105,20 @@ How it works
     intact in this run, or one extra read of a page synced earlier. Without proof nothing is
     rewritten (normal versions are still synced) and the run exits with an error. A page whose
     banner still does not read back after a rewrite is paused for 7 days and listed every run.
-  * Renamed files keep their page: it is retitled, moved under the page of its new folder (when
-    the update tool takes a parent id; --inspect shows it), its history continues, and the version
-    is commented "Renamed from <old path>". Pages of files and folders no longer in git are left
+  * Renamed files keep their page: it is retitled, moved under the page of its new folder (with the
+    update tool's parent id on v1 tools, with moveConfluenceContent on v2 tools; --inspect shows
+    which), its history continues, and the version is commented "Renamed from <old path>".
+  * Pages of files and folders no longer in git (deleted, or now matched by --exclude) are left
     unchanged and listed as warnings on every run until they are archived or deleted in Confluence.
+    With --archive-orphans the sync archives them itself with archiveConfluenceContent (v2 tools),
+    only when that is safe: the page carries the sync-ref marker of that file or folder, nothing is
+    left under it (files are archived before the page of their folder), and the run would archive
+    at most --archive-limit pages (default 20; more archives nothing, since a wrong --branch or
+    --exclude would otherwise archive a whole tree). A page that cannot be archived is listed with
+    the reason. The sync archives a page once: a page unarchived by hand is left alone, and a file
+    added back to git gets a warning until its page is unarchived. Atlassian does not document the
+    parameters of moveConfluenceContent and archiveConfluenceContent: the sync builds their
+    arguments from the schema the endpoint lists, and --inspect prints the schema and the arguments.
   * Rovo MCP tool names changed between Atlassian MCP v1 (createConfluencePage /
     updateConfluencePage) and v2 (createConfluenceContent / updateConfluenceContent).
     The script detects which set your endpoint exposes. Atlassian switches v1 endpoints
@@ -167,11 +177,11 @@ Safety
 
 Exit status
     0  everything requested was done and verified (placeholder ids and dates are warnings only)
-    1  finished but incomplete: a page failed, or a banner restore/update or --adopt takeover
-       was skipped or not verified on read-back (pages paused by an earlier run are only listed),
-       or a repository could not be read with git (a shallow or partial clone, a branch that does
-       not resolve): it is skipped and the other repositories are synced. A repository without
-       any commit yet is only reported.
+    1  finished but incomplete: a page failed (an --archive-orphans archive included), or a
+       banner restore/update or --adopt takeover was skipped or not verified on read-back (pages
+       paused by an earlier run are only listed), or a repository could not be read with git (a
+       shallow or partial clone, a branch that does not resolve): it is skipped and the other
+       repositories are synced. A repository without any commit yet is only reported.
     2  fatal: invalid arguments, unusable state or lock file, authentication or MCP errors, a space
        that cannot be found, a --parent-id that is not a live page of the space
     3  another run holds the lock; nothing was done
@@ -1638,6 +1648,9 @@ class RovoMCP:
     def props(self, tool: str) -> dict:
         return (self.tools.get(tool) or {}).get("properties") or {}
 
+    def required(self, tool: str) -> list[str]:
+        return [r for r in (self.tools.get(tool) or {}).get("required") or [] if isinstance(r, str)]
+
     def pick(self, tool: str, *candidates: str) -> str:
         """Parameter name actually used by the server (casing differs between tools)."""
         props = self.props(tool)
@@ -1737,6 +1750,25 @@ def cql_for_titles(space_key: str, titles: list[str]) -> str:
 
 PARENT_PARAMS = ("parentId", "parent_id", "parentContentId")
 
+# Atlassian MCP v2 tools that move and archive a page. Atlassian does not document their parameters,
+# so their arguments are built from the schema the endpoint lists (--inspect shows the schema and the
+# arguments the sync would send); a schema the sync cannot fill is reported, never guessed at.
+MOVE_TOOL, ARCHIVE_TOOL = "moveConfluenceContent", "archiveConfluenceContent"
+CONTENT_ID_PARAMS = ("contentId", "content_id", "pageId", "page_id", "id")
+MOVE_TARGET_PARAMS = ("parentContentId", "parent_content_id", "targetParentId", "target_parent_id",
+                      "newParentId", "new_parent_id", "parentId", "parent_id", "targetContentId",
+                      "target_content_id", "targetId", "target_id", "destinationId", "destination_id")
+MOVE_TARGET_OBJECTS = ("parent", "target", "destination", "newParent", "new_parent")
+MOVE_POSITIONS = ("append", "child", "inside", "lastChild", "last_child", "last", "end")
+CHILDREN_FLAGS = ("includeChildren", "include_children", "includeDescendants", "include_descendants",
+                  "archiveChildren", "archive_children", "withChildren", "with_children", "recursive", "cascade")
+
+
+def describe_args(args: dict[str, Any] | None) -> str:
+    """Tool arguments as --inspect prints them, without the cloudId."""
+    return ", ".join(f"{k}={json.dumps(v) if isinstance(v, (dict, bool)) else v}"
+                     for k, v in (args or {}).items() if k != "cloudId")
+
 
 class Dialect:
     name = "?"
@@ -1755,6 +1787,103 @@ class Dialect:
         """Parameter of the update tool that moves a page under another parent, if any."""
         props = self.r.props(self.UPDATE)
         return next((p for p in PARENT_PARAMS if p in props), None)
+
+    def _page_args(self, tool: str, page_id: str) -> tuple[dict[str, Any] | None, str]:
+        """Arguments naming one page for `tool`, from the schema the endpoint lists: (args, "") or
+        (None, why they cannot be built)."""
+        if not self.r.reachable(tool, write=True):
+            return None, f"{tool} is not exposed by this endpoint"
+        props = self.r.props(tool)
+        if not props:
+            return None, f"{tool} is not listed with its parameters (on v2, use the ?tools=all endpoint)"
+        id_param = next((c for c in CONTENT_ID_PARAMS if c in props), None)
+        if id_param is None:
+            return None, f"{tool} has no page id parameter the sync recognizes ({', '.join(sorted(props))})"
+        args: dict[str, Any] = {id_param: page_id}
+        if "cloudId" in props:
+            args["cloudId"] = self.cid
+        return args, ""
+
+    def _unfilled(self, tool: str, args: dict[str, Any]) -> str:
+        missing = [r for r in self.r.required(tool) if r not in args]
+        return f"{tool} requires {', '.join(missing)}, which the sync cannot fill" if missing else ""
+
+    def move_args(self, page_id: str, parent_id: str) -> tuple[dict[str, Any] | None, str]:
+        """moveConfluenceContent arguments that put the page under `parent_id`: (args, "") or (None, why)."""
+        args, why = self._page_args(MOVE_TOOL, page_id)
+        if args is None:
+            return None, why
+        props = self.r.props(MOVE_TOOL)
+        target = next((c for c in MOVE_TARGET_PARAMS if c in props), None)
+        holder = next((c for c in MOVE_TARGET_OBJECTS if c in props and isinstance(props[c], dict)
+                       and props[c].get("type") in (None, "object")), None)
+        if target:
+            args[target] = parent_id
+        elif holder:
+            args[holder] = {"parentContentId": parent_id}  # the parent shape of createConfluenceContent
+        else:
+            return None, (f"{MOVE_TOOL} has no parameter the sync recognizes as the new parent "
+                          f"({', '.join(sorted(props))})")
+        position = props.get("position")
+        if isinstance(position, dict) and isinstance(position.get("enum"), list):
+            choice = next((v for v in MOVE_POSITIONS if v in position["enum"]), None)
+            if choice:
+                args["position"] = choice  # last child of the target, like a page created under it
+        why = self._unfilled(MOVE_TOOL, args)
+        return (None, why) if why else (args, "")
+
+    def can_move(self) -> bool:
+        """Can the sync move a page under another parent: with the update tool's parent id (v1
+        tools) or with moveConfluenceContent (v2 tools)?"""
+        return bool(self.parent_param()) or self.move_args("1", "2")[0] is not None
+
+    def move_problem(self) -> str:
+        return "" if self.can_move() else f"{self.UPDATE} takes no parent id and {self.move_args('1', '2')[1]}"
+
+    async def move(self, page_id: str, parent_id: str) -> None:
+        args, why = self.move_args(page_id, parent_id)
+        if args is None:
+            raise RovoError(f"cannot move page {page_id}: {why}")
+        await self.r.call(MOVE_TOOL, args, write=True)
+
+    def archive_args(self, page_id: str) -> tuple[dict[str, Any] | None, str]:
+        """archiveConfluenceContent arguments that archive the page alone, never its children."""
+        args, why = self._page_args(ARCHIVE_TOOL, page_id)
+        if args is None:
+            return None, why
+        props = self.r.props(ARCHIVE_TOOL)
+        for flag in CHILDREN_FLAGS:
+            if flag in props:
+                args[flag] = False
+        ctype = props.get("contentType")
+        if isinstance(ctype, dict) and (not ctype.get("enum") or "page" in ctype["enum"]):
+            args["contentType"] = "page"
+        why = self._unfilled(ARCHIVE_TOOL, args)
+        return (None, why) if why else (args, "")
+
+    def can_archive(self) -> bool:
+        return self.archive_args("1")[0] is not None
+
+    async def archive(self, page_id: str) -> None:
+        args, why = self.archive_args(page_id)
+        if args is None:
+            raise RovoError(f"cannot archive page {page_id}: {why}")
+        await self.r.call(ARCHIVE_TOOL, args, write=True)
+
+    async def child_pages(self, page_id: str) -> list[str]:
+        """Ids of the content directly under the page that is neither archived nor trashed: one CQL
+        search (parent = id). A page is only archived when nothing is left under it."""
+        param = self.r.pick(self.SEARCH, "cql", "query")
+        args: dict[str, Any] = {"cloudId": self.cid, param: f"parent = {page_id}"}
+        if "limit" in self.r.props(self.SEARCH):
+            args["limit"] = 50
+        found = []
+        for d in (await self.r.call(self.SEARCH, args)).dicts():
+            if (d.get("id") not in (None, "") and isinstance(d.get("title"), str)
+                    and str(d.get("type", "page")).lower() not in ("attachment", "comment", "space")
+                    and str(d.get("status", "current")).lower() not in (*GONE_STATUSES, "archived")):
+                found.append(str(d["id"]))
+        return list(dict.fromkeys(found))
 
     async def read(self, page_id: str) -> tuple[ToolResult, str | None]:
         raise NotImplementedError
@@ -1882,6 +2011,8 @@ class V1(Dialect):
         if parent_id and self.parent_param():
             args[self.parent_param()] = parent_id
         await self.r.call(self.UPDATE, args, write=True)
+        if parent_id and not self.parent_param():
+            await self.move(page_id, parent_id)
 
 
 class V2(Dialect):
@@ -1937,6 +2068,10 @@ class V2(Dialect):
         if parent_id and self.parent_param():
             args[self.parent_param()] = parent_id
         await self.r.call(self.UPDATE, args, write=True)
+        if parent_id and not self.parent_param():
+            # v2: the update tool takes no parent; the move comes after the update, whose snapshot
+            # token the move would otherwise make stale
+            await self.move(page_id, parent_id)
 
 
 def pick_dialect(rovo: RovoMCP, cloud_id: str) -> Dialect:
@@ -2142,6 +2277,7 @@ class Ctx:
     pushed: int = 0
     read_proof: str = ""  # a page whose banner came back intact when read in this run
     written: list[str] = field(default_factory=list)  # page ids written in this run
+    moved: set[str] = field(default_factory=set)      # page ids moved under another parent in this run
     rewrites: list[Rewrite] = field(default_factory=list)  # deferred until reads are proven
 
 
@@ -2154,10 +2290,18 @@ REWRITE_LABEL = {"restored": "banner restore", "updated": "banner update", "adop
 REWRITE_PREFIX = {"restored": "Banner restored · ", "updated": "Banner updated · ", "adopted": ""}
 
 
+def page_fields(res: ToolResult) -> dict:
+    """The object that holds the page's own fields (id, status, spaceId...) in a read response: the
+    response itself with the v1 tools, its "data" object with the v2 tools ({"data": {"id": ...}})."""
+    data = res.data if isinstance(res.data, dict) else {}
+    inner = data.get("data")
+    return inner if "id" not in data and isinstance(inner, dict) else data
+
+
 def page_status(res: ToolResult) -> str:
     """Page status in a read response ("current", "trashed", "archived"...), "" if not given.
     A page in the Confluence trash can still be read by id: it must count as deleted."""
-    status = res.data.get("status") if isinstance(res.data, dict) else None
+    status = page_fields(res).get("status")
     return status.lower() if isinstance(status, str) else ""
 
 
@@ -2266,8 +2410,10 @@ async def check_page(ctx: Ctx, plan: RepoPlan, target: Doc | Folder) -> bool:
 
 
 def state_clean(ctx: Ctx, entry: dict, target: Doc | Folder) -> bool:
-    """Known up to date from the state file alone (more checks once the page ids of this run are known)."""
-    if entry.get("banner") != banner_id() or verify_due(entry, ctx.args.verify_hours):
+    """Known up to date from the state file alone (more checks once the page ids of this run are known).
+    Never for a page found archived (its file or folder was gone from git): it is read again, so a file
+    added back gets the "unarchive it" warning, and its entry is rewritten once the page is current."""
+    if entry.get("banner") != banner_id() or verify_due(entry, ctx.args.verify_hours) or entry.get("archived"):
         return False
     return not isinstance(target, Doc) or entry.get("sha") == target.versions[-1].commit
 
@@ -2431,6 +2577,7 @@ async def write(ctx: Ctx, plan: RepoPlan, target: Doc | Folder, title: str, body
         p.title = title
     if parent:
         p.parent = parent
+        ctx.moved.add(p.page_id)
     ctx.pushed += 1
     ctx.written.append(p.page_id)
 
@@ -2445,9 +2592,9 @@ async def alive(ctx: Ctx, plan: RepoPlan, folder: Folder, links: Links) -> str:
     """Page id of the folder's page, checked in this run: read if it was only known from the state
     file, created (with the folders above it) when missing or gone."""
     p = folder.page
-    if p.page_id and (p.page_id in ctx.verified or await check_page(ctx, plan, folder)):
+    if p.page_id and (p.page_id in ctx.verified or await check_page(ctx, plan, folder)) and not p.skip:
         return p.page_id
-    if p.skip:
+    if p.skip:  # e.g. archived in Confluence: nothing is created under it until it is unarchived
         raise RovoError(f"the page of folder {folder.label} is not available (see the warning above)")
     await create_folder(ctx, plan, folder, links)
     return p.page_id
@@ -2515,7 +2662,7 @@ async def sync_doc(ctx: Ctx, plan: RepoPlan, doc: Doc, links: Links) -> None:
     elif not p.created and p.read is None:
         entry = ctx.state.get(p.key) or {}
         if (entry.get("sha") == latest.commit and entry.get("gen") == gen_now and entry.get("title") in titles
-                and entry.get("parent") in (None, folder.page.page_id)):
+                and entry.get("parent") in (None, folder.page.page_id) and not entry.get("archived")):
             log(f"= {doc.path}: up to date ({latest.label})")
             return
         if not await check_page(ctx, plan, doc):
@@ -2544,11 +2691,11 @@ async def sync_doc(ctx: Ctx, plan: RepoPlan, doc: Doc, links: Links) -> None:
     parent = folder.page.page_id
     move = None
     if parent and p.parent != parent and (p.parent is not None or posixpath.dirname(p.renamed_from or doc.path) != doc.folder):
-        if d.parent_param():
+        if d.can_move():
             move = parent = await alive(ctx, plan, folder, links)
         else:
             warn_once(ctx, f"move:{p.key}", f"{doc.path}: page {p.page_id} is not under {folder_titles(plan, folder)[0]!r} "
-                                            f"and {d.UPDATE} takes no parent id: move it in Confluence")
+                                            f"and {d.move_problem()}: move it in Confluence")
 
     # new git versions are always written: they are right whatever page reads return
     token = p.read.token if p.read else None
@@ -2636,7 +2783,7 @@ async def sync_folder(ctx: Ctx, plan: RepoPlan, folder: Folder, links: Links) ->
         return
     else:
         written = p.gen if p.created else m.group(4)
-        move = parent if parent and p.parent and p.parent != parent and d.parent_param() else None
+        move = parent if parent and p.parent and p.parent != parent and d.can_move() else None
         retitle = bool(p.read and p.read.title and p.read.title not in titles and d.can_retitle())
         if written != gen or move or retitle:
             token = (await d.read(p.page_id))[1] if d.needs_snapshot else None
@@ -2688,7 +2835,7 @@ async def sync_repo(ctx: Ctx, plan: RepoPlan) -> int:
         except (RovoError, RuntimeError) as exc:
             warn(f"{plan.name}:{label_of(folder)}: {exc}")
             failures += 1
-    await check_orphans(ctx, plan)
+    failures += await check_orphans(ctx, plan)
     return failures
 
 
@@ -2721,7 +2868,7 @@ async def rewrite_page(ctx: Ctx, r: Rewrite) -> bool:
         message = folder_message(t, newest, REWRITE_PREFIX[r.kind])
         sha = newest.commit if newest else r.plan.tip
     parent = want_parent(ctx, r.plan, t)
-    move = parent if parent and p.parent and p.parent != parent and d.parent_param() else None
+    move = parent if parent and p.parent and p.parent != parent and d.can_move() else None
     token = (await d.read(p.page_id))[1] if d.needs_snapshot else None
     await write(ctx, r.plan, t, title_to_send(r.plan, t), body, message, token, move)
     what = "page adopted" if r.kind == "adopted" else f"banner {r.kind}"
@@ -2771,37 +2918,122 @@ async def apply_rewrites(ctx: Ctx) -> int:
     return failures
 
 
-async def check_orphans(ctx: Ctx, plan: RepoPlan) -> None:
+def orphan_depth(path: str) -> tuple[int, int]:
+    """Sort key that puts the pages below a folder's page before it: a file before the page of its
+    folder, a subfolder before the page of its parent ("docs/a/x.md" > "docs/a/" > "docs/" > "/")."""
+    if path.endswith("/"):
+        folder = path.rstrip("/")
+        return (folder.count("/") + 1 if folder else 0, 0)
+    return (path.count("/") + 1, 1)
+
+
+async def archive_orphan(ctx: Ctx, plan: RepoPlan, path: str, entry: dict, res: ToolResult,
+                         away: set[str]) -> tuple[str, str]:
+    """Archive the page of a file or folder that is no longer in git, only when that is safe: the page
+    carries the sync-ref marker of that path, and nothing is left under it other than pages archived
+    or moved away in this run (`away`). Returns ("archived" | "held" | "failed", why)."""
+    d, page_id = ctx.d, entry["page_id"]
+    m = MARKER_RE.search(res.blob())
+    if not m or m.group(3) != page_key(plan.repo, path):
+        return "held", "it does not carry the sync-ref marker of this path (edited by hand, or not the sync's page)"
+    try:
+        children = [c for c in await d.child_pages(page_id) if c not in away and c != page_id]
+    except RovoError as exc:
+        return "failed", f"its child pages could not be listed ({exc})"
+    if children:
+        return "held", f"pages are still under it ({', '.join(children[:5])}{'…' if len(children) > 5 else ''})"
+    try:
+        await d.archive(page_id)
+    except RovoError as exc:
+        return "failed", f"archiving failed ({exc})"
+    return "archived", ""
+
+
+async def check_orphans(ctx: Ctx, plan: RepoPlan) -> int:
     """Pages of files and folders that are no longer in git at the synced branch (deleted, or now
-    matched by --exclude). They are left unchanged and listed on every run until they are deleted or
-    archived in Confluence. At the --verify-hours cadence each one is read: forgotten once it is gone
-    from Confluence; no longer listed while it is archived (its entry is kept, so a file added back
-    to git finds its page and gets the "unarchive it" warning instead of a second page)."""
+    matched by --exclude); not those of renamed files, which follow their file. Without
+    --archive-orphans they are left unchanged and listed on every run until they are deleted or
+    archived in Confluence. With it, the sync archives each one once (archive_orphan), files before
+    the page of their folder; a page it cannot archive safely is listed with the reason and tried
+    again at the --verify-hours cadence, and a page unarchived by hand afterwards is left alone. At
+    that cadence each one is read: forgotten once it is gone from Confluence; no longer listed while
+    it is archived (its entry is kept, so a file added back to git finds its page and gets the
+    "unarchive it" warning instead of a second page). Returns the number of failures."""
     current = {t.page.key for t in [*plan.docs, *plan.folders.values()]}
-    orphans = []
-    for key, entry in sorted(ctx.state.items()):
-        if not key.startswith(f"{plan.repo}:") or key in current or not isinstance(entry, dict):
-            continue
+    renamed = {f"{plan.repo}:{old}" for doc in plan.docs for old in doc.old_paths}
+    entries = sorted(((key, entry) for key, entry in ctx.state.items()
+                      if key.startswith(f"{plan.repo}:") and key not in current and key not in renamed
+                      and isinstance(entry, dict) and entry.get("page_id") not in ctx.claimed),
+                     key=lambda kv: (orphan_depth(kv[0][len(plan.repo) + 1:]), kv[0]), reverse=True)
+    archive, unavailable = ctx.args.archive_orphans, ""
+    if archive and not ctx.d.can_archive():
+        archive, unavailable = False, ctx.d.archive_args("1")[1]
+    now = int(time.time())
+    live: list[tuple[str, str, dict, ToolResult | None]] = []  # orphans still current in Confluence
+    for key, entry in entries:
         path = key[len(plan.repo) + 1:]
-        if verify_due(entry, ctx.args.verify_hours):
+        due = verify_due(entry, ctx.args.verify_hours)
+        attempt = (archive and not entry.get("archived") and not entry.get("archived_by_sync")
+                   and (due or "archive_held" not in entry))
+        res = None
+        if due or attempt:
             try:
-                status = page_status((await ctx.d.read(entry["page_id"]))[0])
+                res = (await ctx.d.read(entry["page_id"]))[0]
+                status = page_status(res)
             except RovoError:
                 status = "deleted"
             if status in GONE_STATUSES:
                 del ctx.state[key]
                 log(f"  {path}: gone from git and page {entry['page_id']} gone from Confluence; forgotten")
                 continue
-            entry["verified"] = int(time.time())
+            entry["verified"] = now
             entry["archived"] = status == "archived"
         if entry.get("archived"):
-            continue  # archived in Confluence, as the warning asks
-        orphans.append(f"{entry.get('title') or path} (page {entry['page_id']})")
+            continue  # archived in Confluence: by the sync, or by hand as the warning asks
+        live.append((key, path, entry, res if attempt else None))
+    tries = [x for x in live if x[3] is not None]
+    if ctx.args.archive_limit and len(tries) > ctx.args.archive_limit:
+        warn(f"{plan.name}: {len(tries)} pages of files and folders no longer in git would be archived, more than "
+             f"--archive-limit {ctx.args.archive_limit}; none archived. If those files were removed on purpose, "
+             f"run once with --archive-limit {len(tries)}")
+        tries = []
+    failures, away, reasons = 0, set(ctx.moved), {}
+    for key, path, entry, res in tries:
+        outcome, why = await archive_orphan(ctx, plan, path, entry, res, away)
+        if outcome == "archived":
+            away.add(entry["page_id"])
+            try:
+                status = page_status((await ctx.d.read(entry["page_id"]))[0])
+            except RovoError as exc:
+                status = f"unreadable: {exc}"
+            entry.update(archived=True, archived_by_sync=now)
+            entry.pop("archive_held", None)
+            log(f"  {path}: no longer in git; page {entry['page_id']} archived" + (
+                "" if status == "archived" else f" (read back as {status!r}; read again at the next verification)"))
+            continue
+        if outcome == "failed":
+            failures += 1  # tried again on the next run
+        else:
+            entry["archive_held"] = {"why": why, "at": now}  # tried again at the --verify-hours cadence
+        reasons[key] = why
+    orphans = []
+    for key, path, entry, _ in live:
+        if entry.get("archived"):
+            continue
+        why = reasons.get(key) or (entry.get("archive_held") or {}).get("why", "")
+        if not why and archive and entry.get("archived_by_sync"):
+            why = "unarchived in Confluence after the sync archived it; left alone"
+        orphans.append(f"{entry.get('title') or path} (page {entry['page_id']}" + (f": {why})" if why else ")"))
     save_state(ctx.args.state_file, ctx.state)
     if orphans:
+        if archive:
+            what = "Not archived, for the reason given; archive or delete them in Confluence, or fix the reason"
+        else:
+            what = "They are left unchanged; archive or delete them in Confluence" + (
+                f" (--archive-orphans: {unavailable})" if unavailable else "")
         warn(f"{plan.name}: {len(orphans)} page(s) mirror files or folders no longer in git at {plan.branch} "
-             f"(deleted or no longer included). They are left unchanged; archive or delete them in "
-             f"Confluence: {', '.join(orphans)}")
+             f"(deleted or no longer included). {what}: {', '.join(orphans)}")
+    return failures
 
 
 def report_blocked(state: dict) -> None:
@@ -2843,7 +3075,7 @@ async def check_parent(d: Dialect, parent_id: str, space_key: str, space_id: str
     status = page_status(res)
     if status in GONE_STATUSES or status == "archived":
         raise ConfigError(f"--parent-id {parent_id} is a {status} page: {fix}")
-    sid = res.data.get("spaceId") if isinstance(res.data, dict) else None
+    sid = page_fields(res).get("spaceId")
     if sid not in (None, "") and str(sid) != str(space_id):
         raise ConfigError(f"--parent-id {parent_id} is a page of the space with id {sid}, not of space {space_key} "
                           f"(id {space_id}): {fix}")
@@ -3081,9 +3313,19 @@ def readiness(rovo: RovoMCP, d: Dialect, args: argparse.Namespace) -> bool:
         line(what, tool + (f" ({', '.join(notes)})" if notes else ""))
     if rovo.reachable(d.UPDATE, True):
         param = d.parent_param()
-        line("move pages", f"{d.UPDATE} {param}: the page of a file moved to another folder follows it" if param
-             else f"{d.UPDATE} takes no parent id: the page of a file moved to another folder stays under "
-                  f"the old folder page")
+        moving, why = d.move_args("<page>", "<new parent page>")
+        if param:
+            line("move pages", f"{d.UPDATE} {param}: the page of a file moved to another folder follows it")
+        elif moving:
+            line("move pages", f"{MOVE_TOOL} ({describe_args(moving)}): the page of a file moved to another "
+                               f"folder follows it")
+        else:
+            line("move pages", f"{d.UPDATE} takes no parent id and {why}: the page of a file moved to another "
+                               f"folder stays under the old folder page")
+    archiving, why = d.archive_args("<page>")
+    line("archive pages", f"{ARCHIVE_TOOL} ({describe_args(archiving)}): with --archive-orphans, the pages of "
+                          f"files and folders deleted from git are archived" if archiving else
+                          f"{why}: the pages of files and folders deleted from git are only listed as warnings")
     if args.cloud_id:
         line("site", f"--cloud-id {args.cloud_id}")
     elif rovo.reachable("getAccessibleAtlassianResources"):
@@ -3118,7 +3360,8 @@ async def inspect(args: argparse.Namespace) -> int:
         except RovoError as exc:
             log(f"\n{exc}")
             return 2
-        for name in [*names, "getAccessibleAtlassianResources", "executeRead", "executeWrite", "execute"]:
+        for name in [*names, MOVE_TOOL, ARCHIVE_TOOL, "getAccessibleAtlassianResources", "executeRead",
+                     "executeWrite", "execute"]:
             if name in rovo.tools:
                 log(f"\n--- {name}\n{json.dumps(rovo.tools[name], indent=1)}")
         ok = readiness(rovo, d, args)
@@ -3344,6 +3587,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                      help="take over a page without sync banner that has the title of a file or folder page and "
                           "sits where that page belongs, once page reads are proven (restores the banner of a "
                           "mirrored page when the state file was lost)")
+    dst.add_argument("--archive-orphans", action="store_true",
+                     help="archive the pages of files and folders no longer in git (deleted, or now matched by "
+                          "--exclude) with archiveConfluenceContent (v2 tools): only a page that carries the "
+                          "sync-ref marker of that path and has nothing left under it, files before the page of "
+                          "their folder, once per page. Without it those pages are only listed as warnings")
+    dst.add_argument("--archive-limit", type=_non_negative_int, default=20,
+                     help="with --archive-orphans: archive nothing in a run that would archive more than N pages "
+                          "(default 20; 0 = no limit), so a wrong --branch or --exclude cannot archive a whole tree")
     dst.add_argument("--transform-cmd",
                      help="command: page markdown on stdin -> page markdown on stdout. Run as an argument "
                           "list without a shell, in an empty temporary folder, without this script's "

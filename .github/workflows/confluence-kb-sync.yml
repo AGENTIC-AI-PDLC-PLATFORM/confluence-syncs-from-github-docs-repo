@@ -5,12 +5,17 @@
 #   Variables: CONFLUENCE_SPACE_KEY (e.g. KB), ATLASSIAN_CLOUD_ID (e.g. https://acme.atlassian.net),
 #              KB_SYNC_CLIENT_ID (the GitHub App's Client ID, Iv…) or KB_SYNC_APP_ID (its numeric
 #              App ID), optional KB_TOPIC (default kb-sync), KB_MODE (tags|commits),
-#              KB_CALLS_PER_HOUR (default 450, safe on every plan; Standard: 900), KB_INCLUDE_HEAD (default true)
+#              KB_CALLS_PER_HOUR (default 450, safe on every plan; Standard: 900), KB_INCLUDE_HEAD (default true),
+#              KB_ARCHIVE_LIMIT (default 20: a run that would archive more pages archives none)
 #   Never pass --transform-cmd from workflow_dispatch inputs or dispatch payloads: it runs as a
 #   command on the runner. Hard-code it in this file or keep it in an admin-only variable.
-#   Secrets:   ATLASSIAN_SERVICE_KEY (Atlassian service account API key with Confluence
-#              read/write/search MCP scopes), KB_SYNC_APP_PRIVATE_KEY (GitHub App with
-#              Contents: read on the org repositories)
+#   Secrets:   ATLASSIAN_SERVICE_KEY (Atlassian service account API token, sent as Bearer, with the
+#              Confluence scopes of the Rovo MCP endpoint in use: read:confluence:agent-interface,
+#              write:confluence:agent-interface and search:confluence:agent-interface for the v2
+#              endpoint set below; the granular ones, e.g. read:page:confluence, write:page:confluence,
+#              read:space:confluence and search:confluence, for v1. A token with both sets works on
+#              both endpoints), KB_SYNC_APP_PRIVATE_KEY (GitHub App with Contents: read on the org
+#              repositories)
 #   Atlassian: an org admin enables API-token authentication for the Rovo MCP Server.
 name: Confluence KB sync
 
@@ -119,10 +124,17 @@ jobs:
           TOPIC: ${{ vars.KB_TOPIC || 'kb-sync' }}
           CALLS_PER_HOUR: ${{ vars.KB_CALLS_PER_HOUR || '450' }}
           INCLUDE_HEAD: ${{ vars.KB_INCLUDE_HEAD || 'true' }}
+          ARCHIVE_LIMIT: ${{ vars.KB_ARCHIVE_LIMIT || '20' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           chmod +x sync_org.sh
-          extra=(--mode "$MODE" --calls-per-hour "$CALLS_PER_HOUR")
+          # --endpoint: Rovo MCP v2 tools, needed to move and archive pages. To switch back, remove it.
+          # After removing it, the line reads:
+          #   extra=(--mode "$MODE" --calls-per-hour "$CALLS_PER_HOUR")
+          extra=(--mode "$MODE" --calls-per-hour "$CALLS_PER_HOUR" --endpoint "https://mcp.atlassian.com/v2/mcp?tools=all")
+          # Archive the pages of files and folders deleted from git, at most ARCHIVE_LIMIT per run.
+          # Needs the v2 endpoint above: on v1 those pages are only listed as warnings.
+          extra+=(--archive-orphans --archive-limit "$ARCHIVE_LIMIT")
           if [ "$MODE" = tags ] && [ "$INCLUDE_HEAD" = true ]; then extra+=(--include-head); fi
           if [ "$DRY_RUN" = true ]; then extra+=(--dry-run); fi
           ./sync_org.sh "${{ github.repository_owner }}" "$TOPIC" -- "${extra[@]}"
