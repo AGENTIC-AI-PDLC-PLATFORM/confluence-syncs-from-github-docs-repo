@@ -2773,8 +2773,10 @@ async def apply_rewrites(ctx: Ctx) -> int:
 
 async def check_orphans(ctx: Ctx, plan: RepoPlan) -> None:
     """Pages of files and folders that are no longer in git at the synced branch (deleted, or now
-    matched by --exclude). They are left unchanged and listed on every run. At the --verify-hours
-    cadence each one is read, and forgotten once it is gone from Confluence."""
+    matched by --exclude). They are left unchanged and listed on every run until they are deleted or
+    archived in Confluence. At the --verify-hours cadence each one is read: forgotten once it is gone
+    from Confluence; no longer listed while it is archived (its entry is kept, so a file added back
+    to git finds its page and gets the "unarchive it" warning instead of a second page)."""
     current = {t.page.key for t in [*plan.docs, *plan.folders.values()]}
     orphans = []
     for key, entry in sorted(ctx.state.items()):
@@ -2783,14 +2785,17 @@ async def check_orphans(ctx: Ctx, plan: RepoPlan) -> None:
         path = key[len(plan.repo) + 1:]
         if verify_due(entry, ctx.args.verify_hours):
             try:
-                gone = page_status((await ctx.d.read(entry["page_id"]))[0]) in GONE_STATUSES
+                status = page_status((await ctx.d.read(entry["page_id"]))[0])
             except RovoError:
-                gone = True
-            if gone:
+                status = "deleted"
+            if status in GONE_STATUSES:
                 del ctx.state[key]
                 log(f"  {path}: gone from git and page {entry['page_id']} gone from Confluence; forgotten")
                 continue
             entry["verified"] = int(time.time())
+            entry["archived"] = status == "archived"
+        if entry.get("archived"):
+            continue  # archived in Confluence, as the warning asks
         orphans.append(f"{entry.get('title') or path} (page {entry['page_id']})")
     save_state(ctx.args.state_file, ctx.state)
     if orphans:
